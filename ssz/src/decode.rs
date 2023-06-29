@@ -51,6 +51,8 @@ pub enum DecodeError {
     BytesInvalid(String),
     /// The given union selector is out of bounds.
     UnionSelectorInvalid(u8),
+    /// The object requires a context to be decoded.
+    ContextRequired,
 }
 
 /// Performs checks on the `offset` based upon the other parameters provided.
@@ -91,6 +93,11 @@ pub fn sanitize_offset(
     }
 }
 
+/// Implement this on a type that can be used to decode `T` along with the bytes of `T`.
+pub trait DecodeContext<T> {
+    fn deserialize(&self, bytes: &[u8]) -> Result<T, DecodeError>;
+}
+
 /// Provides SSZ decoding (de-serialization) via the `from_ssz_bytes(&bytes)` method.
 ///
 /// See `examples/` for manual implementations or the crate root for implementations using
@@ -115,6 +122,17 @@ pub trait Decode: Sized {
     /// The supplied bytes must be the exact length required to decode `Self`, excess bytes will
     /// result in an error.
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError>;
+
+    /// Attempts to decode `Self` from `bytes` & a `context`, returning a `DecodeError` on failure.
+    ///
+    /// The supplied bytes must be the exact length required to decode `Self`, excess bytes will
+    /// result in an error.
+    fn from_ssz_bytes_with_context<C: DecodeContext<Self>>(
+        bytes: &[u8],
+        context: &C,
+    ) -> Result<Self, DecodeError> {
+        context.deserialize(bytes)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]

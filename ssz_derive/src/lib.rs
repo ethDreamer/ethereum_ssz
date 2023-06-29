@@ -194,6 +194,8 @@ struct FieldOpts {
     skip_serializing: bool,
     #[darling(default)]
     skip_deserializing: bool,
+    #[darling(default)]
+    pass_context: bool,
 }
 
 enum Procedure<'a> {
@@ -763,7 +765,9 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
     let mut register_types = vec![];
     let mut field_names = vec![];
     let mut fixed_decodes = vec![];
+    let mut fixed_decodes_with_context = vec![];
     let mut decodes = vec![];
+    let mut decodes_with_context = vec![];
     let mut is_fixed_lens = vec![];
     let mut fixed_lens = vec![];
 
@@ -789,18 +793,29 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
                 let #ident = <_>::default();
             });
 
+            decodes_with_context.push(quote! {
+                let #ident = <_>::default();
+            });
+
+            fixed_decodes_with_context.push(quote! {
+                let #ident = <_>::default();
+            });
+
             continue;
         }
 
         let is_ssz_fixed_len;
         let ssz_fixed_len;
         let from_ssz_bytes;
+        let from_ssz_bytes_with_context;
         if let Some(module) = field_opts.with {
             let module = quote! { #module::decode };
 
             is_ssz_fixed_len = quote! { #module::is_ssz_fixed_len() };
             ssz_fixed_len = quote! { #module::ssz_fixed_len() };
             from_ssz_bytes = quote! { #module::from_ssz_bytes(slice) };
+            from_ssz_bytes_with_context =
+                quote! { #module::from_ssz_bytes_with_context(slice, context) };
 
             register_types.push(quote! {
                 builder.register_type_parameterized(#is_ssz_fixed_len, #ssz_fixed_len)?;
@@ -808,10 +823,21 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
             decodes.push(quote! {
                 let #ident = decoder.decode_next_with(|slice| #module::from_ssz_bytes(slice))?;
             });
+            if !field_opts.pass_context {
+                decodes_with_context.push(quote! {
+                    let #ident = decoder.decode_next_with(|slice| #module::from_ssz_bytes(slice))?;
+                });
+            } else {
+                decodes_with_context.push( quote! {
+                    let #ident = decoder.decode_next_with(|slice| #module::from_ssz_bytes_with_context(slice, context))?;
+                })
+            }
         } else {
             is_ssz_fixed_len = quote! { <#ty as ssz::Decode>::is_ssz_fixed_len() };
             ssz_fixed_len = quote! { <#ty as ssz::Decode>::ssz_fixed_len() };
             from_ssz_bytes = quote! { <#ty as ssz::Decode>::from_ssz_bytes(slice) };
+            from_ssz_bytes_with_context =
+                quote! { <#ty as ssz::Decode>::from_ssz_bytes_with_context(slice, context) };
 
             register_types.push(quote! {
                 builder.register_type::<#ty>()?;
@@ -819,9 +845,18 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
             decodes.push(quote! {
                 let #ident = decoder.decode_next()?;
             });
+            if !field_opts.pass_context {
+                decodes_with_context.push(quote! {
+                    let #ident = decoder.decode_next()?;
+                });
+            } else {
+                decodes_with_context.push(quote! {
+                    let #ident = decoder.decode_next_with(|slice| #from_ssz_bytes_with_context)?;
+                });
+            }
         }
 
-        fixed_decodes.push(quote! {
+        let no_context = quote! {
             let #ident = {
                 start = end;
                 end = end
@@ -836,7 +871,30 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
                     })?;
                 #from_ssz_bytes?
             };
-        });
+        };
+        fixed_decodes.push(no_context.clone());
+
+        if !field_opts.pass_context {
+            fixed_decodes_with_context.push(no_context);
+        } else {
+            fixed_decodes_with_context.push(quote! {
+                let #ident = {
+                    start = end;
+                    end = end
+                        .checked_add(#ssz_fixed_len)
+                        .ok_or_else(|| ssz::DecodeError::OutOfBoundsByte {
+                            i: usize::max_value()
+                        })?;
+                    let slice = bytes.get(start..end)
+                        .ok_or_else(|| ssz::DecodeError::InvalidByteLength {
+                            len: bytes.len(),
+                            expected: end
+                        })?;
+                    #from_ssz_bytes_with_context?
+                };
+            });
+        }
+
         is_fixed_lens.push(is_ssz_fixed_len);
         fixed_lens.push(ssz_fixed_len);
     }
@@ -896,6 +954,49 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
 
                     #(
                         #decodes
+                    )*
+
+
+                    Ok(Self {
+                        #(
+                            #field_names,
+                        )*
+                    })
+                }
+            }
+
+            fn from_ssz_bytes_with_context<C: DecodeContext<Self>>(bytes: &[u8], context: &C) -> Result<Self, DecodeError> {
+                if <Self as ssz::Decode>::is_ssz_fixed_len() {
+                    if bytes.len() != <Self as ssz::Decode>::ssz_fixed_len() {
+                        return Err(ssz::DecodeError::InvalidByteLength {
+                            len: bytes.len(),
+                            expected: <Self as ssz::Decode>::ssz_fixed_len(),
+                        });
+                    }
+
+                    let mut start: usize = 0;
+                    let mut end = start;
+
+                    #(
+                        #fixed_decodes_with_context
+                    )*
+
+                    Ok(Self {
+                        #(
+                            #field_names,
+                        )*
+                    })
+                } else {
+                    let mut builder = ssz::SszDecoderBuilder::new(bytes);
+
+                    #(
+                        #register_types
+                    )*
+
+                    let mut decoder = builder.build()?;
+
+                    #(
+                        #decodes_with_context
                     )*
 
 
