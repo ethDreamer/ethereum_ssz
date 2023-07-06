@@ -251,21 +251,24 @@ impl<'a> Procedure<'a> {
                 }
 
                 match opts.enum_behaviour.as_deref() {
-                    Some("union") => Procedure::Enum {
+                    Some(ENUM_UNION) => Procedure::Enum {
                         data,
                         behaviour: EnumBehaviour::Union,
                     },
-                    Some("transparent") => Procedure::Enum {
+                    Some(ENUM_TRANSPARENT) => Procedure::Enum {
                         data,
                         behaviour: EnumBehaviour::Transparent,
                     },
-                    Some("tag") => Procedure::Enum {
+                    Some(ENUM_TAG) => Procedure::Enum {
                         data,
                         behaviour: EnumBehaviour::Tag,
                     },
                     Some(other) => panic!(
-                        "{} is not a valid enum behaviour, use \"container\" or \"transparent\"",
-                        other
+                        "{} is not a valid enum behaviour, use \"{}\", \"{}\", or \"{}\"",
+                        other,
+                        ENUM_UNION,
+                        ENUM_TRANSPARENT,
+                        ENUM_TAG,
                     ),
                     None => panic!("{}", NO_ENUM_BEHAVIOUR_ERROR),
                 }
@@ -527,7 +530,7 @@ fn ssz_encode_derive_struct_transparent(
 /// The "transparent" method is distinct from the "union" method specified in the SSZ specification.
 /// When using "transparent", the enum will be ignored and the contained field will be serialized as
 /// if the enum does not exist. Since an union variant "selector" is not serialized, it is not
-/// possible to reliably decode an enum that is serialized transparently.
+/// possible to reliably decode an enum that is serialized transparently without a context.
 ///
 /// ## Limitations
 ///
@@ -741,10 +744,7 @@ pub fn ssz_decode_derive(input: TokenStream) -> TokenStream {
         Procedure::Enum { data, behaviour } => match behaviour {
             EnumBehaviour::Union => ssz_decode_derive_enum_union(&item, data),
             EnumBehaviour::Tag => ssz_decode_derive_enum_tag(&item, data),
-            EnumBehaviour::Transparent => panic!(
-                "Decode cannot be derived for enum_behaviour \"{}\", only \"{}\" and \"{}\" is valid.",
-                ENUM_TRANSPARENT, ENUM_UNION, ENUM_TAG,
-            ),
+            EnumBehaviour::Transparent => ssz_decode_derive_enum_transparent(&item, data),
         },
     }
 }
@@ -770,6 +770,8 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
     let mut decodes_with_context = vec![];
     let mut is_fixed_lens = vec![];
     let mut fixed_lens = vec![];
+
+    let mut any_field_requires_context = false;
 
     for (ty, ident, field_opts) in parse_ssz_fields(struct_data) {
         let ident = match ident {
@@ -877,6 +879,7 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
         if !field_opts.pass_context {
             fixed_decodes_with_context.push(no_context);
         } else {
+            any_field_requires_context = true;
             fixed_decodes_with_context.push(quote! {
                 let #ident = {
                     start = end;
@@ -899,7 +902,73 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
         fixed_lens.push(ssz_fixed_len);
     }
 
+    let with_context_impl = if any_field_requires_context {
+        quote! {
+            fn from_ssz_bytes_with_context<C: DecodeContext<Self>>(bytes: &[u8], context: &C) -> Result<Self, DecodeError> {
+                if <Self as ssz::Decode>::is_ssz_fixed_len() {
+                    if bytes.len() != <Self as ssz::Decode>::ssz_fixed_len() {
+                        return Err(ssz::DecodeError::InvalidByteLength {
+                            len: bytes.len(),
+                            expected: <Self as ssz::Decode>::ssz_fixed_len(),
+                        });
+                    }
+
+                    let mut start: usize = 0;
+                    let mut end = start;
+
+                    #(
+                        #fixed_decodes_with_context
+                    )*
+
+                    Ok(Self {
+                        #(
+                            #field_names,
+                        )*
+                    })
+                } else {
+                    let mut builder = ssz::SszDecoderBuilder::new(bytes);
+
+                    #(
+                        #register_types
+                    )*
+
+                    let mut decoder = builder.build()?;
+
+                    #(
+                        #decodes_with_context
+                    )*
+
+
+                    Ok(Self {
+                        #(
+                            #field_names,
+                        )*
+                    })
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let decode_context_impl = if any_field_requires_context {
+        quote! {}
+        /*
+        quote! {
+            impl DecodeContext<#name #ty_generics> for ChainSpec #where_clause {
+                fn deserialize(&self, bytes: &[u8]) -> Result<#name ty_generics, DecodeError> {
+                    <#name #ty_generics as ssz::Decode>::from_ssz_bytes_with_context(bytes, self)
+                }
+            }
+        }
+         */
+    } else {
+        quote! {}
+    };
+
     let output = quote! {
+        #decode_context_impl
+
         impl #impl_generics ssz::Decode for #name #ty_generics #where_clause {
             fn is_ssz_fixed_len() -> bool {
                 #(
@@ -965,48 +1034,7 @@ fn ssz_decode_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Tok
                 }
             }
 
-            fn from_ssz_bytes_with_context<C: DecodeContext<Self>>(bytes: &[u8], context: &C) -> Result<Self, DecodeError> {
-                if <Self as ssz::Decode>::is_ssz_fixed_len() {
-                    if bytes.len() != <Self as ssz::Decode>::ssz_fixed_len() {
-                        return Err(ssz::DecodeError::InvalidByteLength {
-                            len: bytes.len(),
-                            expected: <Self as ssz::Decode>::ssz_fixed_len(),
-                        });
-                    }
-
-                    let mut start: usize = 0;
-                    let mut end = start;
-
-                    #(
-                        #fixed_decodes_with_context
-                    )*
-
-                    Ok(Self {
-                        #(
-                            #field_names,
-                        )*
-                    })
-                } else {
-                    let mut builder = ssz::SszDecoderBuilder::new(bytes);
-
-                    #(
-                        #register_types
-                    )*
-
-                    let mut decoder = builder.build()?;
-
-                    #(
-                        #decodes_with_context
-                    )*
-
-
-                    Ok(Self {
-                        #(
-                            #field_names,
-                        )*
-                    })
-                }
-            }
+            #with_context_impl
         }
     };
     output.into()
@@ -1096,7 +1124,32 @@ fn ssz_decode_derive_struct_transparent(
     output.into()
 }
 
-/// Derive `ssz::Decode` for an `enum` following the "tag" SSZ spec.
+/// Derive `ssz::Decode` for an `enum` following the "transparent" method.
+///
+/// ## Limitations
+///
+/// Only supports:
+/// - Enums with a single field per variant, where
+///     - All fields are variably sized from an SSZ-perspective (not fixed size).
+fn ssz_decode_derive_enum_transparent(derive_input: &DeriveInput, _enum_data: &DataEnum) -> TokenStream {
+    let name = &derive_input.ident;
+    let (impl_generics, ty_generics, where_clause) = &derive_input.generics.split_for_impl();
+
+    let output = quote! {
+        impl #impl_generics ssz::Decode for #name #ty_generics #where_clause {
+            fn is_ssz_fixed_len() -> bool {
+                false
+            }
+
+            fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+                Err(ssz::DecodeError::ContextRequired)
+            }
+        }
+    };
+    output.into()
+}
+
+/// Derive `ssz::Decode` for an `enum` following the "tag" method.
 fn ssz_decode_derive_enum_tag(derive_input: &DeriveInput, enum_data: &DataEnum) -> TokenStream {
     let name = &derive_input.ident;
     let (impl_generics, ty_generics, where_clause) = &derive_input.generics.split_for_impl();
